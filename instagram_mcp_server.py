@@ -15,7 +15,7 @@ ACCESS_TOKEN = os.environ.get("INSTAGRAM_ACCESS_TOKEN", "")
 IG_USER_ID   = os.environ.get("INSTAGRAM_USER_ID", "")
 BASE_URL     = "https://graph.instagram.com/v21.0"
 
-mcp = FastMCP("instagram-growth-mcp", stateless_http=True)
+mcp = FastMCP("instagram-growth-mcp", stateless_http=True, host="0.0.0.0")
 
 async def ig_get(endpoint: str, params: dict = {}) -> dict:
     p = dict(params)
@@ -275,4 +275,5 @@ async def get_saves_analysis() -> str:
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(mcp.streamable_http_app(), host="0.0.0.0", port=8000)
+    app = mcp.streamable_http_app()
+    uvicorn.run(app, host="0.0.0.0", port=8000, forwarded_allow_ips="*")
