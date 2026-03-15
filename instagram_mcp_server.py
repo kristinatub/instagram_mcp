@@ -1,7 +1,7 @@
 """
 Instagram Growth Analytics MCP Server
 For: kristinatubera / Femme Finance Official
-Simple HTTP JSON-RPC - no SSE transport library needed
+Implements OAuth discovery endpoints Claude requires
 """
 
 import json
@@ -13,12 +13,13 @@ import httpx
 import uvicorn
 from starlette.applications import Starlette
 from starlette.requests import Request
-from starlette.responses import JSONResponse, StreamingResponse
+from starlette.responses import JSONResponse, StreamingResponse, Response
 from starlette.routing import Route
 
 ACCESS_TOKEN = os.environ.get("INSTAGRAM_ACCESS_TOKEN", "")
 IG_USER_ID   = os.environ.get("INSTAGRAM_USER_ID", "")
 BASE_URL     = "https://graph.instagram.com/v21.0"
+SERVER_URL   = os.environ.get("SERVER_URL", "https://instagrammcp-production.up.railway.app")
 
 async def ig_get(endpoint: str, params: dict = {}) -> dict:
     p = dict(params)
@@ -202,50 +203,97 @@ async def execute_tool(name: str, args: dict) -> str:
     return fmt({"error": f"Unknown tool: {name}"})
 
 
+# ─── CORS HEADERS ─────────────────────────────────────────────────────────────
+CORS = {
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type, Authorization, Accept",
+}
+
+# ─── OAUTH DISCOVERY ENDPOINTS (Claude requires these) ────────────────────────
+async def oauth_protected_resource(request: Request):
+    """Claude hits this to discover if auth is needed."""
+    return JSONResponse({
+        "resource": SERVER_URL,
+        "authorization_servers": [],
+        "bearer_methods_supported": [],
+        "resource_documentation": f"{SERVER_URL}/health"
+    }, headers=CORS)
+
+async def oauth_authorization_server(request: Request):
+    """Claude hits this to discover OAuth config. We return empty = no auth needed."""
+    return JSONResponse({
+        "issuer": SERVER_URL,
+        "authorization_endpoint": f"{SERVER_URL}/oauth/authorize",
+        "token_endpoint": f"{SERVER_URL}/oauth/token",
+        "response_types_supported": ["code"],
+        "grant_types_supported": ["authorization_code"],
+    }, headers=CORS)
+
+async def oauth_register(request: Request):
+    """Dynamic client registration — return a fake client_id."""
+    return JSONResponse({
+        "client_id": "instagram-mcp-client",
+        "client_secret": "not-needed",
+        "redirect_uris": [],
+    }, headers=CORS)
+
+# ─── MAIN ENDPOINTS ───────────────────────────────────────────────────────────
 async def handle_health(request: Request):
-    return JSONResponse({"status": "ok", "server": "instagram-growth-mcp", "tools": len(TOOLS)})
+    return JSONResponse({"status": "ok", "server": "instagram-growth-mcp", "tools": len(TOOLS)}, headers=CORS)
 
 async def handle_sse(request: Request):
+    """SSE transport endpoint."""
     async def event_stream():
         yield f"data: {json.dumps({'type': 'endpoint', 'url': '/mcp'})}\n\n"
         while True:
             await asyncio.sleep(15)
             yield ": keepalive\n\n"
     return StreamingResponse(event_stream(), media_type="text/event-stream",
-        headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "Access-Control-Allow-Origin": "*"})
+        headers={**CORS, "Cache-Control": "no-cache", "Connection": "keep-alive"})
 
 async def handle_mcp(request: Request):
+    """Streamable HTTP MCP endpoint."""
     if request.method == "OPTIONS":
-        return JSONResponse({}, headers={"Access-Control-Allow-Origin": "*", "Access-Control-Allow-Methods": "POST, OPTIONS", "Access-Control-Allow-Headers": "Content-Type"})
+        return Response(status_code=204, headers=CORS)
     try:
         body = await request.json()
     except Exception:
-        return JSONResponse({"jsonrpc":"2.0","id":None,"error":{"code":-32700,"message":"Parse error"}})
+        return JSONResponse({"jsonrpc":"2.0","id":None,"error":{"code":-32700,"message":"Parse error"}}, headers=CORS)
+
     id_ = body.get("id")
     method = body.get("method", "")
     params = body.get("params", {})
+
     try:
         if method == "initialize":
-            return JSONResponse({"jsonrpc":"2.0","id":id_,"result":{"protocolVersion":"2024-11-05","capabilities":{"tools":{}},"serverInfo":{"name":"instagram-growth-mcp","version":"1.0.0"}}})
+            return JSONResponse({"jsonrpc":"2.0","id":id_,"result":{"protocolVersion":"2024-11-05","capabilities":{"tools":{}},"serverInfo":{"name":"instagram-growth-mcp","version":"1.0.0"}}}, headers=CORS)
         if method in ["notifications/initialized", "ping"]:
-            return JSONResponse({"jsonrpc":"2.0","id":id_,"result":{}})
+            return JSONResponse({"jsonrpc":"2.0","id":id_,"result":{}}, headers=CORS)
         if method == "tools/list":
-            return JSONResponse({"jsonrpc":"2.0","id":id_,"result":{"tools":TOOLS}})
+            return JSONResponse({"jsonrpc":"2.0","id":id_,"result":{"tools":TOOLS}}, headers=CORS)
         if method == "tools/call":
             name = params.get("name","")
             args = params.get("arguments", {})
             result = await execute_tool(name, args)
-            return JSONResponse({"jsonrpc":"2.0","id":id_,"result":{"content":[{"type":"text","text":result}]}})
-        return JSONResponse({"jsonrpc":"2.0","id":id_,"error":{"code":-32601,"message":f"Method not found: {method}"}})
+            return JSONResponse({"jsonrpc":"2.0","id":id_,"result":{"content":[{"type":"text","text":result}]}}, headers=CORS)
+        return JSONResponse({"jsonrpc":"2.0","id":id_,"error":{"code":-32601,"message":f"Method not found: {method}"}}, headers=CORS)
     except Exception as e:
-        return JSONResponse({"jsonrpc":"2.0","id":id_,"error":{"code":-32603,"message":str(e)}})
+        return JSONResponse({"jsonrpc":"2.0","id":id_,"error":{"code":-32603,"message":str(e)}}, headers=CORS)
 
 
 app = Starlette(routes=[
     Route("/", handle_health),
     Route("/health", handle_health),
+    # OAuth discovery — Claude probes these before connecting
+    Route("/.well-known/oauth-protected-resource", oauth_protected_resource),
+    Route("/.well-known/oauth-protected-resource/sse", oauth_protected_resource),
+    Route("/.well-known/oauth-authorization-server", oauth_authorization_server),
+    Route("/.well-known/oauth-authorization-server/sse", oauth_authorization_server),
+    Route("/register", oauth_register, methods=["POST", "OPTIONS"]),
+    # MCP endpoints
     Route("/sse", handle_sse, methods=["GET"]),
-    Route("/mcp", handle_mcp, methods=["POST", "OPTIONS"]),
+    Route("/mcp", handle_mcp, methods=["POST", "OPTIONS", "GET"]),
     Route("/messages", handle_mcp, methods=["POST", "OPTIONS"]),
 ])
 
