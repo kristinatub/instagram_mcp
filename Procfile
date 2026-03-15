@@ -1,1 +1,1 @@
-worker: python instagram_mcp_server.py
+web: python instagram_mcp_server.py
