@@ -1,6 +1,5 @@
 """
 Instagram Growth Analytics MCP Server
-For: kristinatubera / Femme Finance Official
 Connects Claude to Instagram Graph API for deep growth analytics
 """
 
@@ -11,7 +10,11 @@ from datetime import datetime, timedelta
 from typing import Any
 import httpx
 from mcp.server import Server
-from mcp.server.stdio import stdio_server
+from mcp.server.sse import SseServerTransport
+from starlette.applications import Starlette
+from starlette.routing import Route, Mount
+from starlette.requests import Request
+import uvicorn
 from mcp import types
 
 # ─── CONFIG ───────────────────────────────────────────────────────────────────
@@ -454,10 +457,29 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
     return [types.TextContent(type="text", text=f"Unknown tool: {name}")]
 
 
-# ─── MAIN ─────────────────────────────────────────────────────────────────────
-async def main():
-    async with stdio_server() as (read_stream, write_stream):
-        await app.run(read_stream, write_stream, app.create_initialization_options())
+# ─── HTTP/SSE SERVER FOR RAILWAY ─────────────────────────────────────────────
+sse = SseServerTransport("/messages/")
+
+async def handle_sse(request: Request):
+    async with sse.connect_sse(request.scope, request.receive, request._send) as streams:
+        await app.run(streams[0], streams[1], app.create_initialization_options())
+
+async def handle_messages(request: Request):
+    await sse.handle_post_message(request.scope, request.receive, request._send)
+
+async def handle_health(request: Request):
+    from starlette.responses import JSONResponse
+    return JSONResponse({"status": "ok", "server": "instagram-growth-mcp"})
+
+starlette_app = Starlette(
+    routes=[
+        Route("/", handle_health),
+        Route("/health", handle_health),
+        Route("/sse", handle_sse),
+        Mount("/messages/", app=sse.handle_post_message),
+    ]
+)
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run(starlette_app, host="0.0.0.0", port=port)
